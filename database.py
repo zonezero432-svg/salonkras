@@ -18,7 +18,7 @@ class DBManager:
             self._check_db_structure()
             self._migrate_db()
             self._ensure_admin_exists()
-            print("База данных подключена. Система безопасности и связей активна.")
+            print("База данных КРАСНАЯ КОРОЛЕВА подключена. Система безопасности и связей активна.")
         except Exception as e:
             print(f"Ошибка подключения к БД: {e}")
 
@@ -80,7 +80,6 @@ class DBManager:
     def _migrate_db(self):
         if not self.conn: return
         with self.conn.cursor() as cur:
-            # Миграция времени работы мастеров
             cur.execute("""
                 DO $$ 
                 BEGIN 
@@ -90,7 +89,6 @@ class DBManager:
                     END IF;
                 END $$;
             """)
-            # Миграция для множественного выбора услуг (перенос старых service_id в новую таблицу)
             cur.execute("""
                 DO $$ 
                 BEGIN 
@@ -98,9 +96,21 @@ class DBManager:
                         INSERT INTO appointment_services (appointment_id, service_id)
                         SELECT id, service_id FROM appointments WHERE service_id IS NOT NULL
                         ON CONFLICT DO NOTHING;
-                        
                         ALTER TABLE appointments DROP COLUMN service_id;
                     END IF;
+                END $$;
+            """)
+            # Принудительная перезапись ключей для фикса бага с удалением мастера
+            cur.execute("""
+                DO $$
+                BEGIN
+                    ALTER TABLE appointments DROP CONSTRAINT IF EXISTS appointments_master_id_fkey;
+                    ALTER TABLE appointments ADD CONSTRAINT appointments_master_id_fkey FOREIGN KEY (master_id) REFERENCES masters(id) ON DELETE CASCADE;
+                    
+                    ALTER TABLE users DROP CONSTRAINT IF EXISTS users_master_id_fkey;
+                    ALTER TABLE users ADD CONSTRAINT users_master_id_fkey FOREIGN KEY (master_id) REFERENCES masters(id) ON DELETE CASCADE;
+                EXCEPTION
+                    WHEN others THEN null;
                 END $$;
             """)
 
@@ -113,9 +123,7 @@ class DBManager:
     def is_first_run(self):
         if not self.conn: return False
         users_count = self.fetch("SELECT COUNT(id) as count FROM users")
-        if users_count and users_count[0]['count'] <= 1:
-            return True
-        return False
+        return True if users_count and users_count[0]['count'] <= 1 else False
 
     def login(self, username, password):
         user = self.fetch("SELECT * FROM users WHERE username=%s AND password=%s", (username, password))
@@ -151,6 +159,7 @@ class DBManager:
                    a.appointment_date, a.status, 
                    COALESCE(string_agg(s.name, ', '), 'Без услуг') as service,
                    COALESCE(SUM(s.price), 0) as price,
+                   COALESCE(SUM(s.duration), 0) as total_duration,
                    MAX(s.category) as category
             FROM appointments a 
             JOIN clients c ON a.client_id = c.id
@@ -162,12 +171,15 @@ class DBManager:
         if master_id:
             query += " WHERE a.master_id = %s "
             params.append(master_id)
-            
         query += " GROUP BY a.id, c.name, m.name, a.appointment_date, a.status ORDER BY a.appointment_date DESC"
         return self.fetch(query, tuple(params) if params else None)
 
+    def get_appointment_services(self, app_id):
+        res = self.fetch("SELECT service_id FROM appointment_services WHERE appointment_id = %s", (app_id,))
+        return [r['service_id'] for r in res]
+
     def add_appointment(self, client_id, master_id, service_ids, dt_obj):
-        if not self.conn: return False
+        if not self.conn: return False, "БД недоступна"
         try:
             with self.conn.cursor() as cur:
                 cur.execute(
@@ -180,23 +192,60 @@ class DBManager:
                         "INSERT INTO appointment_services (appointment_id, service_id) VALUES (%s, %s)",
                         (app_id, sid)
                     )
-            return True
+            return True, app_id
         except Exception as e:
-            print(f"Ошибка создания записи: {e}")
-            return False
+            return False, str(e)
 
-    def is_master_free(self, master_id, start_dt, service_ids):
+    def update_appointment(self, app_id, client_id, master_id, service_ids, dt_obj):
+        if not self.conn: return False, "БД недоступна"
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE appointments SET client_id=%s, master_id=%s, appointment_date=%s WHERE id=%s",
+                    (client_id, master_id, dt_obj, app_id)
+                )
+                cur.execute("DELETE FROM appointment_services WHERE appointment_id=%s", (app_id,))
+                for sid in service_ids:
+                    cur.execute(
+                        "INSERT INTO appointment_services (appointment_id, service_id) VALUES (%s, %s)",
+                        (app_id, sid)
+                    )
+            return True, app_id
+        except Exception as e:
+            return False, str(e)
+
+    def is_master_free(self, master_id, start_dt, service_ids, ignore_app_id=None):
         if start_dt < datetime.now():
             return False, "Нельзя записать на прошедшее время"
         if not service_ids:
             return False, "Не выбраны услуги"
+
+        # Проверка рабочих часов мастера
+        master_info = self.fetch("SELECT work_start, work_end FROM masters WHERE id=%s", (master_id,))
+        if not master_info: return False, "Мастер не найден"
+        
+        # Получаем часы и минуты начала и конца
+        ws_h, ws_m = map(int, master_info[0]['work_start'].split(':'))
+        we_h, we_m = map(int, master_info[0]['work_end'].split(':'))
+        
+        # Подставляем их в дату записи (start_dt) для четкого сравнения
+        work_start_dt = start_dt.replace(hour=ws_h, minute=ws_m, second=0, microsecond=0)
+        work_end_dt = start_dt.replace(hour=we_h, minute=we_m, second=0, microsecond=0)
+        
+        # Если мастер работает в ночь (конец меньше начала), прибавляем день
+        if work_end_dt < work_start_dt:
+            work_end_dt += timedelta(days=1)
 
         format_strings = ','.join(['%s'] * len(service_ids))
         res = self.fetch(f"SELECT SUM(duration) as total_duration FROM services WHERE id IN ({format_strings})", tuple(service_ids))
         duration = res[0]['total_duration'] if res and res[0]['total_duration'] else 60
         end_dt = start_dt + timedelta(minutes=int(duration))
 
-        overlap = self.fetch("""
+        if start_dt < work_start_dt or end_dt > work_end_dt:
+            return False, f"График мастера: с {master_info[0]['work_start']} до {master_info[0]['work_end']}. Услуга длится {duration} мин."
+
+        # Проверка пересечений
+        query = """
             WITH app_durations AS (
                 SELECT a.id, a.appointment_date as start_time,
                        a.appointment_date + (COALESCE(SUM(s.duration), 60) || ' minutes')::interval as end_time
@@ -204,32 +253,69 @@ class DBManager:
                 LEFT JOIN appointment_services aserv ON a.id = aserv.appointment_id
                 LEFT JOIN services s ON aserv.service_id = s.id
                 WHERE a.master_id = %s AND a.status NOT IN ('Отмена', 'Завершено')
+        """
+        params = [master_id]
+        if ignore_app_id:
+            query += " AND a.id != %s"
+            params.append(ignore_app_id)
+            
+        query += """
                 GROUP BY a.id, a.appointment_date
             )
             SELECT id FROM app_durations
             WHERE (start_time, end_time) OVERLAPS (%s, %s)
-        """, (master_id, start_dt, end_dt))
+        """
+        params.extend([start_dt, end_dt])
         
+        overlap = self.fetch(query, tuple(params))
         if overlap:
             return False, "Мастер занят в этот интервал (пересечение с другой записью)"
         return True, "OK"
 
-    def get_stats_summary(self):
+    def get_stats_summary(self, start_date, end_date):
         rev = self.fetch("""
             SELECT SUM(s.price) as total 
             FROM appointments a 
             JOIN appointment_services aserv ON a.id = aserv.appointment_id
             JOIN services s ON aserv.service_id = s.id 
-            WHERE a.status = 'Завершено'
-        """)
-        cli = self.fetch("SELECT COUNT(id) as total FROM clients")
+            WHERE a.status = 'Завершено' AND a.appointment_date >= %s AND a.appointment_date <= %s
+        """, (start_date, end_date))
+        cli = self.fetch("SELECT COUNT(DISTINCT client_id) as total FROM appointments WHERE appointment_date >= %s AND appointment_date <= %s", (start_date, end_date))
         return (rev[0]['total'] or 0), (cli[0]['total'] or 0)
 
-    def get_service_demand_report(self):
+    def get_service_demand_report(self, start_date, end_date):
         return self.fetch("""
             SELECT s.name, COUNT(a.id) as count, SUM(s.price) as total_revenue
             FROM services s 
-            LEFT JOIN appointment_services aserv ON s.id = aserv.service_id
-            LEFT JOIN appointments a ON aserv.appointment_id = a.id AND a.status = 'Завершено'
+            JOIN appointment_services aserv ON s.id = aserv.service_id
+            JOIN appointments a ON aserv.appointment_id = a.id 
+            WHERE a.status = 'Завершено' AND a.appointment_date >= %s AND a.appointment_date <= %s
             GROUP BY s.name ORDER BY count DESC
-        """)
+        """, (start_date, end_date))
+
+    def get_top_master(self, start_date, end_date):
+        res = self.fetch("""
+            SELECT m.name, SUM(s.price) as revenue
+            FROM masters m
+            JOIN appointments a ON m.id = a.master_id
+            JOIN appointment_services aserv ON a.id = aserv.appointment_id
+            JOIN services s ON aserv.service_id = s.id
+            WHERE a.status = 'Завершено' AND a.appointment_date >= %s AND a.appointment_date <= %s
+            GROUP BY m.name ORDER BY revenue DESC LIMIT 1
+        """, (start_date, end_date))
+        return res[0] if res else {"name": "Нет данных", "revenue": 0}
+
+    def get_top_client(self, start_date, end_date):
+        res = self.fetch("""
+            SELECT c.name, SUM(s.price) as spent
+            FROM clients c
+            JOIN appointments a ON c.id = a.client_id
+            JOIN appointment_services aserv ON a.id = aserv.appointment_id
+            JOIN services s ON aserv.service_id = s.id
+            WHERE a.status = 'Завершено' AND a.appointment_date >= %s AND a.appointment_date <= %s
+            GROUP BY c.name ORDER BY spent DESC LIMIT 1
+        """, (start_date, end_date))
+        return res[0] if res else {"name": "Нет данных", "spent": 0}
+
+    def close(self):
+        if self.conn: self.conn.close()
